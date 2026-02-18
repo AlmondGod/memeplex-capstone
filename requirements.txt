@@ -6,3 +6,6 @@ numpy>=1.24.0
 tqdm>=4.65.0
 gymnasium>=0.28.0
 matplotlib>=3.9.0
+
+# SMAC v2 — StarCraft Multi-Agent Challenge v2
+smacv2 @ git+https://github.com/oxwhirl/smacv2.git@main

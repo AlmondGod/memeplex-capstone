@@ -37,3 +37,9 @@ runs/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# StarCraft II (SMAC v2)
+StarCraftII/
+3rdparty/
+SMAC_Maps.zip
+*.SC2Replay
