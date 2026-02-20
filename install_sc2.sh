@@ -7,6 +7,13 @@
 # Env vars you can set BEFORE running:
 #   SC2PATH  — where to put StarCraft II (default: ~/StarCraftII)
 #
+# Container / noexec note:
+#   If the target path lands on a noexec filesystem (e.g. /dev/shm inside
+#   Docker), SC2_x64 will not execute even with correct mode bits.
+#   In that case, run with SC2PATH pointing to a normal filesystem:
+#     SC2PATH=/workspace/StarCraftII bash install_sc2.sh
+#   Or use the automatic fix step at the bottom of this script.
+#
 # Usage:
 #   bash install_sc2.sh
 # ===========================================================================
@@ -48,6 +55,32 @@ if [ ! -d "$MAP_DIR" ] || [ -z "$(ls -A "$MAP_DIR" 2>/dev/null)" ]; then
     echo ">> Maps installed to $MAP_DIR"
 else
     echo ">> SMAC maps already present at $MAP_DIR"
+fi
+
+# ---------- noexec filesystem fix ------------------------------------------
+# If SC2PATH lives on a noexec-mounted filesystem (common in containers where
+# /dev/shm has the noexec flag), copy the executables to /workspace/StarCraftII
+# so pysc2 can actually launch them.
+NEED_EXEC_FIX=false
+if ! python3 -c "import os,sys; sys.exit(0 if os.access('$SC2PATH/Versions/Base75689/SC2_x64',os.X_OK) else 1)" 2>/dev/null && \
+   ! python3.13 -c "import os,sys; sys.exit(0 if os.access('$SC2PATH/Versions/Base75689/SC2_x64',os.X_OK) else 1)" 2>/dev/null; then
+    NEED_EXEC_FIX=true
+fi
+
+if [ "$NEED_EXEC_FIX" = true ]; then
+    EXEC_PATH="/workspace/StarCraftII"
+    echo ">> WARNING: $SC2PATH appears to be on a noexec filesystem."
+    echo ">> Copying binaries to $EXEC_PATH (symlinks for large data dirs)..."
+    mkdir -p "$EXEC_PATH"
+    cp -r "$SC2PATH/Versions"   "$EXEC_PATH/"
+    cp -r "$SC2PATH/Libs"       "$EXEC_PATH/"
+    cp -r "$SC2PATH/Interfaces" "$EXEC_PATH/"
+    cp    "$SC2PATH/.build.info" "$EXEC_PATH/" 2>/dev/null || true
+    for d in SC2Data Maps Battle.net Replays; do
+        ln -sfn "$SC2PATH/$d" "$EXEC_PATH/$d"
+    done
+    export SC2PATH="$EXEC_PATH"
+    echo ">> Binaries copied. SC2PATH updated to $SC2PATH"
 fi
 
 # ---------- Verify ----------------------------------------------------------

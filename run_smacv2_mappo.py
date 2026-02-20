@@ -460,19 +460,61 @@ class MAPPOTrainer:
 # Plotting
 # ===========================================================================
 
-def plot_training_curves(steps, rewards, win_rates, save_path):
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+def rolling_mean(values: list, window: int = 10) -> list:
+    """Simple trailing rolling mean."""
+    out = []
+    for i in range(len(values)):
+        sl = values[max(0, i - window + 1): i + 1]
+        out.append(float(np.mean(sl)))
+    return out
 
-    ax1.plot(steps, rewards, color="tab:blue", linewidth=1.5)
-    ax1.set_ylabel("Mean Episode Reward")
-    ax1.set_title("MAPPO on SMAC v2 — Training Curves")
-    ax1.grid(True, alpha=0.3)
 
-    ax2.plot(steps, win_rates, color="tab:green", linewidth=1.5)
-    ax2.set_xlabel("Env Steps")
-    ax2.set_ylabel("Win Rate")
-    ax2.set_ylim(-0.05, 1.05)
-    ax2.grid(True, alpha=0.3)
+def plot_training_curves(
+    steps,
+    rewards,
+    win_rates,
+    pg_losses,
+    vf_losses,
+    entropies,
+    save_path,
+    window: int = 10,
+):
+    """4-panel training figure: reward, win rate, pg/vf loss, entropy."""
+    fig, axes = plt.subplots(4, 1, figsize=(11, 12), sharex=True)
+    fig.suptitle("MAPPO on SMAC v2 — Training Curves", fontsize=13, fontweight="bold")
+
+    # Panel 1 — Episode reward
+    ax = axes[0]
+    ax.plot(steps, rewards, color="tab:blue", linewidth=0.8, alpha=0.4, label="raw")
+    ax.plot(steps, rolling_mean(rewards, window), color="tab:blue", linewidth=1.8, label=f"rolling({window})")
+    ax.set_ylabel("Mean Episode Reward")
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2 — Win rate
+    ax = axes[1]
+    ax.plot(steps, win_rates, color="tab:green", linewidth=0.8, alpha=0.4)
+    ax.plot(steps, rolling_mean(win_rates, window), color="tab:green", linewidth=1.8)
+    ax.set_ylabel("Win Rate")
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(True, alpha=0.3)
+
+    # Panel 3 — Policy loss & value loss
+    ax = axes[2]
+    if pg_losses:
+        ax.plot(steps, pg_losses, color="tab:red",    linewidth=1.5, label="pg_loss")
+        ax.plot(steps, vf_losses, color="tab:orange", linewidth=1.5, label="vf_loss")
+        ax.legend(fontsize=8, loc="upper right")
+    ax.set_ylabel("Loss")
+    ax.grid(True, alpha=0.3)
+
+    # Panel 4 — Entropy
+    ax = axes[3]
+    if entropies:
+        ax.plot(steps, entropies, color="tab:purple", linewidth=1.5)
+    ax.set_ylabel("Entropy")
+    ax.set_xlabel("Env Steps")
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
@@ -536,6 +578,7 @@ def run_train(args):
 
     total_steps = 0
     log_steps, log_rewards, log_win_rates = [], [], []
+    log_pg_losses, log_vf_losses, log_entropies = [], [], []
     t_start = time.time()
 
     n_iters = args.total_steps // args.rollout_steps
@@ -553,13 +596,16 @@ def run_train(args):
             log_steps.append(total_steps)
             log_rewards.append(stats["mean_reward"])
             log_win_rates.append(stats["win_rate"])
+            log_pg_losses.append(update_stats["pg_loss"])
+            log_vf_losses.append(update_stats["vf_loss"])
+            log_entropies.append(update_stats["entropy"])
 
         if (iteration + 1) % args.log_interval == 0 and stats["episodes"] > 0:
             elapsed = time.time() - t_start
             pbar.set_postfix({
                 "rew": f"{stats['mean_reward']:.2f}",
-                "wr": f"{stats['win_rate']:.2%}",
-                "pg": f"{update_stats['pg_loss']:.4f}",
+                "wr":  f"{stats['win_rate']:.2%}",
+                "pg":  f"{update_stats['pg_loss']:.4f}",
             })
             tqdm.write(
                 f"Step {total_steps:>8d} | "
@@ -585,19 +631,30 @@ def run_train(args):
     # Plot
     if log_steps:
         plot_path = os.path.join(args.save_dir, "smacv2_mappo_training.png")
-        plot_training_curves(log_steps, log_rewards, log_win_rates, plot_path)
+        plot_training_curves(
+            log_steps, log_rewards, log_win_rates,
+            log_pg_losses, log_vf_losses, log_entropies,
+            plot_path,
+        )
 
     # Save results JSON
     results = {
+        "algorithm": "MAPPO",
         "total_steps": total_steps,
         "wall_clock_seconds": elapsed,
         "race": args.race,
         "scenario": f"{args.n_units}v{args.n_enemies}",
-        "final_mean_reward": log_rewards[-1] if log_rewards else 0.0,
-        "final_win_rate": log_win_rates[-1] if log_win_rates else 0.0,
-        "rewards_history": log_rewards,
-        "win_rate_history": log_win_rates,
-        "steps_history": log_steps,
+        "final_mean_reward": float(np.mean(log_rewards[-10:])) if log_rewards else 0.0,
+        "final_win_rate":    float(np.mean(log_win_rates[-10:])) if log_win_rates else 0.0,
+        "final_pg_loss":     float(np.mean(log_pg_losses[-10:])) if log_pg_losses else 0.0,
+        "final_vf_loss":     float(np.mean(log_vf_losses[-10:])) if log_vf_losses else 0.0,
+        "final_entropy":     float(np.mean(log_entropies[-10:])) if log_entropies else 0.0,
+        "rewards_history":   log_rewards,
+        "win_rate_history":  log_win_rates,
+        "pg_loss_history":   log_pg_losses,
+        "vf_loss_history":   log_vf_losses,
+        "entropy_history":   log_entropies,
+        "steps_history":     log_steps,
     }
     results_path = os.path.join(args.save_dir, "smacv2_mappo_results.json")
     with open(results_path, "w") as f:
