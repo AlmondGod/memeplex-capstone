@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 
@@ -139,17 +140,25 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    # Normalise dashes→underscores (argparse does this, but be explicit)
-    # Also alias MADDPG log/save interval args onto the unified names
-    args.log_interval  = getattr(args, "maddpg_log_interval",  args.log_interval  if hasattr(args, "log_interval")  else 1000)
-    args.save_interval = getattr(args, "maddpg_save_interval", args.save_interval if hasattr(args, "save_interval") else 50000)
+    # Alias MADDPG log/save interval args onto the unified names
+    args.log_interval  = getattr(args, "maddpg_log_interval",  1000)
+    args.save_interval = getattr(args, "maddpg_save_interval", 50000)
 
     import numpy as np
     import torch
+    from datetime import datetime
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+
+    # For training runs, create a timestamped sub-directory so successive
+    # runs never overwrite each other's checkpoints or plots.
+    if args.mode == "train":
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.save_dir = os.path.join(args.save_dir, f"{args.algorithm}_{timestamp}")
+        os.makedirs(args.save_dir, exist_ok=True)
+        print(f"Save dir  : {args.save_dir}")
 
     print(f"Algorithm : {args.algorithm.upper()}")
     print(f"Mode      : {args.mode}")

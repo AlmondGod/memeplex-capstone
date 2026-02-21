@@ -296,15 +296,26 @@ class MAPPOTrainer:
         self.update_epochs = update_epochs
         self.num_mini_batches = num_mini_batches
 
+        # Track whether env has been reset at least once
+        self._started = False
+        self._episode_reward = 0.0
+
     def collect_rollout(self, rollout_steps: int):
-        """Collect a rollout of `rollout_steps` transitions."""
+        """Collect a rollout of `rollout_steps` transitions.
+
+        The env is kept alive across rollout calls (no full restart each time).
+        A reset only happens at the very start and when an episode terminates.
+        """
         buffer = RolloutBuffer()
         episode_rewards = []
-        episode_reward = 0.0
         win_count = 0
         episode_count = 0
 
-        self.env.reset()
+        # Only reset at the very first call; after that continue mid-episode
+        if not self._started:
+            self.env.reset()
+            self._started = True
+
         self.policy.eval()
 
         for step in range(rollout_steps):
@@ -348,14 +359,14 @@ class MAPPOTrainer:
                 actions, log_probs, rewards, dones, avail_arr, values,
             )
 
-            episode_reward += reward
+            self._episode_reward += reward
             if terminated:
-                episode_rewards.append(episode_reward)
+                episode_rewards.append(self._episode_reward)
                 if info.get("battle_won", False):
                     win_count += 1
                 episode_count += 1
-                episode_reward = 0.0
-                self.env.reset()
+                self._episode_reward = 0.0
+                self.env.reset()   # start next episode inside same SC2 process
 
         # Last values for GAE
         with torch.no_grad():
