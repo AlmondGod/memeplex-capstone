@@ -61,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-dim",   type=int,   default=128)
     parser.add_argument("--seed",         type=int,   default=42)
     parser.add_argument("--cpu",          action="store_true", help="Force CPU")
+    parser.add_argument("--render",       action="store_true",
+                        help="Open SC2 window for visualization (eval/test modes)")
 
     # ── Logging / checkpointing ───────────────────────────────────────────
     parser.add_argument("--save-dir",     type=str, default="checkpoints")

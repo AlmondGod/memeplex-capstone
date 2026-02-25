@@ -2,6 +2,57 @@
 
 > These instructions get the full MARL training environment running on a
 > fresh Linux machine (e.g. a cloud GPU instance).
+>
+> **macOS users: see [Mac Setup](#mac-setup) below first.**
+
+---
+
+## Mac Setup
+
+> Tested on Apple Silicon (M-series) with StarCraft II installed via the Blizzard launcher.
+
+### Prerequisites
+- StarCraft II installed at `/Applications/StarCraft II` via Blizzard app
+- Python 3.9 with `torch` and `numpy` (e.g. `brew install python@3.9`)
+
+### One-command setup
+
+```bash
+bash setup_mac.sh
+```
+
+This script:
+1. Detects `SC2PATH` (defaults to `/Applications/StarCraft II`)
+2. Downloads and installs the 30 SMAC v2 maps into `$SC2PATH/Maps/SMAC_Maps/`
+3. Installs `pysc2`, `smacv2`, `six`, `tqdm`, `matplotlib` via `pip3`
+4. Verifies imports and prints a reminder to export `SC2PATH`
+
+### Persist the environment variable
+
+Add to your `~/.zshrc`:
+
+```bash
+export SC2PATH="/Applications/StarCraft II"
+```
+
+### Correct Python interpreter
+
+Use `python3.9` (the one that has `torch` installed) for all SMAC commands:
+
+```bash
+python3.9 run_smacv2_mappo.py --mode test --test-episodes 1
+```
+
+### Visualization
+
+On Mac the SC2 window opens automatically. Use `--render` for a **larger window (1280×720)**:
+
+```bash
+python3.9 run_smacv2_mappo.py --mode eval \
+  --load-path checkpoints/my_run/smacv2_mappo_latest.pt --render
+```
+
+---
 
 ## 1. Clone the repo
 

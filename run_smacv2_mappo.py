@@ -43,6 +43,12 @@ from typing import Dict, List, Optional, Tuple
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
+# Mac: default SC2PATH to Blizzard app location if not set
+if not os.environ.get("SC2PATH"):
+    _mac_default = "/Applications/StarCraft II"
+    if os.path.isdir(_mac_default):
+        os.environ["SC2PATH"] = _mac_default
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -108,11 +114,19 @@ def build_distribution_config(race: str, n_units: int, n_enemies: int) -> dict:
     }
 
 
-def make_env(race: str, n_units: int, n_enemies: int):
-    """Create a single SMACv2 environment instance."""
+def make_env(race: str, n_units: int, n_enemies: int, render: bool = False):
+    """Create a single SMACv2 environment instance.
+
+    Args:
+        render: If True, use a larger window size for better visualization.
+                On Mac, SC2 always opens a visible window (pysc2 uses -displayMode 0
+                on non-Linux). The render flag controls window size only.
+    """
     from smacv2.env.starcraft2.wrapper import StarCraftCapabilityEnvWrapper
 
     dist_config = build_distribution_config(race, n_units, n_enemies)
+    # On Mac, SC2 launches in a window by default. Use larger window for render mode.
+    window_x, window_y = (1280, 720) if render else (640, 480)
     env = StarCraftCapabilityEnvWrapper(
         capability_config=dist_config,
         map_name=RACE_MAP_NAMES[race],
@@ -121,6 +135,8 @@ def make_env(race: str, n_units: int, n_enemies: int):
         obs_own_pos=True,
         use_unit_ranges=True,
         min_attack_range=2,
+        window_size_x=window_x,
+        window_size_y=window_y,
     )
     return env
 
@@ -540,7 +556,7 @@ def plot_training_curves(
 def run_test(args):
     """Quick smoke test with random agents."""
     print(f"=== Smoke Test: {args.race} {args.n_units}v{args.n_enemies} ===")
-    env = make_env(args.race, args.n_units, args.n_enemies)
+    env = make_env(args.race, args.n_units, args.n_enemies, render=getattr(args, 'render', False))
     env_info = env.get_env_info()
     print(f"  n_agents:    {env_info['n_agents']}")
     print(f"  n_actions:   {env_info['n_actions']}")
@@ -575,7 +591,7 @@ def run_train(args):
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     print(f"Device: {device}")
 
-    env = make_env(args.race, args.n_units, args.n_enemies)
+    env = make_env(args.race, args.n_units, args.n_enemies, render=False)
     trainer = MAPPOTrainer(
         env=env, device=device, lr=args.lr, gamma=args.gamma,
         gae_lambda=args.gae_lambda, clip_coef=args.clip_coef,
@@ -684,9 +700,12 @@ def run_eval(args):
 
     print(f"=== MAPPO Evaluation: {args.race} {args.n_units}v{args.n_enemies} ===")
     print(f"Loading: {args.load_path}")
+    render = getattr(args, 'render', False)
+    if render:
+        print("Render mode ON — StarCraft II window will open.")
 
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
-    env = make_env(args.race, args.n_units, args.n_enemies)
+    env = make_env(args.race, args.n_units, args.n_enemies, render=render)
     trainer = MAPPOTrainer(env=env, device=device, hidden_dim=args.hidden_dim)
     trainer.load(args.load_path)
     trainer.policy.eval()
@@ -786,6 +805,8 @@ def main():
     parser.add_argument("--cpu", action="store_true",
                         help="Force CPU even if CUDA available")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--render", action="store_true",
+                        help="Open SC2 window for visualization (eval/test modes)")
 
     args = parser.parse_args()
 
