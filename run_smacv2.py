@@ -1,6 +1,6 @@
 """Unified SMACv2 training entry point.
 
-Dispatches to MAPPO or MADDPG based on the --algorithm flag.
+Dispatches to MAPPO, MADDPG, or TarMAC based on the --algorithm flag.
 All other arguments are passed through to the chosen algorithm.
 
 Usage:
@@ -10,17 +10,16 @@ Usage:
     # MADDPG
     python run_smacv2.py --algorithm maddpg --mode train
 
-    # Short run
-    python run_smacv2.py --algorithm mappo  --mode train --total-steps 200000
-    python run_smacv2.py --algorithm maddpg --mode train --total-steps 200000
+    # TarMAC (targeted multi-agent communication)
+    python run_smacv2.py --algorithm tarmac --mode train
+    python run_smacv2.py --algorithm tarmac --mode train --comm-dim 32 --comm-rounds 2
 
     # Smoke test
-    python run_smacv2.py --algorithm mappo  --mode test
-    python run_smacv2.py --algorithm maddpg --mode test
+    python run_smacv2.py --algorithm tarmac --mode test
 
     # Evaluate a checkpoint
-    python run_smacv2.py --algorithm mappo  --mode eval --load-path checkpoints/smacv2_mappo_latest.pt
-    python run_smacv2.py --algorithm maddpg --mode eval --load-path checkpoints/smacv2_maddpg_latest.pt
+    python run_smacv2.py --algorithm tarmac --mode eval \\
+        --load-path checkpoints/smacv2_tarmac_latest.pt --render
 """
 
 from __future__ import annotations
@@ -39,9 +38,14 @@ def build_parser() -> argparse.ArgumentParser:
     # ── Algorithm selector ────────────────────────────────────────────────
     parser.add_argument(
         "--algorithm", "-a",
-        choices=["mappo", "maddpg"],
+        choices=["mappo", "maddpg", "tarmac"],
         default="mappo",
         help="RL algorithm to run",
+    )
+
+    parser.add_argument(
+        "--description", type=str, default="",
+        help="Optional free-text description of this run (logged to save_dir)"
     )
 
     # ── Mode ──────────────────────────────────────────────────────────────
@@ -104,6 +108,13 @@ def build_parser() -> argparse.ArgumentParser:
     maddpg.add_argument("--maddpg-save-interval", type=int, default=50_000,
                         help="(MADDPG) checkpoint every N env steps")
 
+    # ── TarMAC-specific ───────────────────────────────────────────────────
+    tarmac = parser.add_argument_group("TarMAC-specific")
+    tarmac.add_argument("--comm-dim",    type=int, default=16,
+                        help="Message dimensionality for key/value/query heads")
+    tarmac.add_argument("--comm-rounds", type=int, default=1,
+                        help="Communication rounds per step before acting")
+
     return parser
 
 
@@ -118,6 +129,17 @@ def run_mappo(args: argparse.Namespace):
         mappo_mod.run_eval(args)
     elif args.mode == "test":
         mappo_mod.run_test(args)
+
+
+def run_tarmac(args: argparse.Namespace):
+    """Dispatch to the TarMAC run functions in run_smacv2_tarmac.py."""
+    import run_smacv2_tarmac as tarmac_mod
+    if args.mode == "train":
+        tarmac_mod.run_train(args)
+    elif args.mode == "eval":
+        tarmac_mod.run_eval(args)
+    elif args.mode == "test":
+        tarmac_mod.run_test(args)
 
 
 def run_maddpg(args: argparse.Namespace):
@@ -170,8 +192,10 @@ def main():
 
     if args.algorithm == "mappo":
         run_mappo(args)
-    else:
+    elif args.algorithm == "maddpg":
         run_maddpg(args)
+    else:
+        run_tarmac(args)
 
 
 if __name__ == "__main__":
