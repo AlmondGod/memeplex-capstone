@@ -63,26 +63,44 @@ RACE_MAP_NAMES = {
 }
 
 
+RACE_CONFIGS = {
+    "terran": {
+        "unit_types": ["marine", "marauder", "medivac"],
+        "exception_unit_types": ["medivac"],
+        "weights": [0.45, 0.45, 0.1],
+    },
+    "protoss": {
+        "unit_types": ["stalker", "zealot", "colossus"],
+        "exception_unit_types": ["colossus"],
+        "weights": [0.45, 0.45, 0.1],
+    },
+    "zerg": {
+        "unit_types": ["zergling", "baneling", "hydralisk"],
+        "exception_unit_types": ["baneling"],
+        "weights": [0.45, 0.1, 0.45],
+    },
+}
+
+
 def build_distribution_config(race: str, n_units: int, n_enemies: int) -> dict:
-    unit_types = {
-        "terran":  [48, 49, 51],   # Marine, Marauder, Medivac
-        "protoss": [73, 74, 75],   # Zealot, Stalker, Colossus
-        "zerg":    [105, 107, 126],# Zergling, Roach, Hydralisk
-    }
-    types = unit_types[race]
+    rc = RACE_CONFIGS[race]
     return {
-        "ally_start_positions":   {"n_units": n_units,   "map_x": 32, "map_y": 32},
-        "enemy_start_positions":  {"n_enemies": n_enemies,"map_x": 32, "map_y": 32},
         "n_units":   n_units,
         "n_enemies": n_enemies,
         "team_gen": {
             "dist_type": "weighted_teams",
-            "unit_types": types,
-            "exception_unit_types": [],
-            "weights": [1 / len(types)] * len(types),
+            "unit_types": rc["unit_types"],
+            "exception_unit_types": rc["exception_unit_types"],
+            "weights": rc["weights"],
             "observe": True,
         },
-        "start_positions": {"dist_type": "random", "n_units": n_units, "map_x": 32, "map_y": 32, "constrain_distance": 7},
+        "start_positions": {
+            "dist_type": "surrounded_and_reflect",
+            "p": 0.5,
+            "n_enemies": n_enemies,
+            "map_x": 32,
+            "map_y": 32,
+        },
     }
 
 
@@ -398,22 +416,26 @@ class TarMACTrainer:
         return reward, terminated, info
 
     # ------------------------------------------------------------------
-    def collect_rollout(self, n_steps: int) -> Tuple[float, float, bool]:
+    def collect_rollout(self, n_steps: int) -> Tuple[float, float]:
         """
         Collect up to n_steps steps (may span multiple episodes).
-        Returns (ep_reward, win).
+        Returns (ep_reward, win_rate) where win_rate is the fraction of
+        completed episodes within this rollout that were won.
         """
         self.buffer.clear()
         self.env.reset()
-        ep_reward  = 0.0
-        won        = False
-        terminated = False
+        ep_reward   = 0.0
+        win_count   = 0
+        episode_count = 0
+        terminated  = False
 
         for _ in range(n_steps):
             reward, terminated, info = self._step()
             ep_reward += reward
             if terminated:
-                won = info.get("battle_won", False)
+                episode_count += 1
+                if info.get("battle_won", False):
+                    win_count += 1
                 self.env.reset()
                 terminated = False
 
@@ -426,7 +448,8 @@ class TarMACTrainer:
             last_val_np = last_val.cpu().numpy() * np.ones(self.n_agents, dtype=np.float32)
 
         returns, advantages = self.buffer.compute_returns(last_val_np, self.gamma, self.gae_lambda)
-        return ep_reward, won
+        win_rate = win_count / max(episode_count, 1)
+        return ep_reward, win_rate
 
     # ------------------------------------------------------------------
     def update(self) -> Dict[str, float]:
@@ -621,7 +644,7 @@ def run_train(args):
         trainer.load(args.load_path)
 
     os.makedirs(args.save_dir, exist_ok=True)
-    all_rewards, all_wins = [], []
+    all_rewards, all_wins, all_steps, all_times = [], [], [], []
     t_start = time.time()
     steps_done = 0
 
@@ -629,21 +652,23 @@ def run_train(args):
     update_idx = 0
 
     while steps_done < args.total_steps:
-        ep_reward, won = trainer.collect_rollout(args.rollout_steps)
+        ep_reward, win_rate = trainer.collect_rollout(args.rollout_steps)
         metrics = trainer.update()
         steps_done += args.rollout_steps
         update_idx += 1
         pbar.update(args.rollout_steps)
 
         all_rewards.append(ep_reward)
-        all_wins.append(float(won))
+        all_wins.append(float(win_rate))
+        all_steps.append(steps_done)
+        all_times.append(time.time() - t_start)
 
         if update_idx % args.log_interval == 0:
-            win_rate = np.mean(all_wins[-20:]) if all_wins else 0.0
-            elapsed  = time.time() - t_start
+            rolling_wr = np.mean(all_wins[-20:]) if all_wins else 0.0
+            elapsed    = time.time() - t_start
             pbar.write(
                 f"Step {steps_done:6d} | reward={ep_reward:7.2f} | "
-                f"win_rate={win_rate:.2%} | "
+                f"win_rate={rolling_wr:.2%} | "
                 f"pg_loss={metrics['pg_loss']:.4f} | "
                 f"vf_loss={metrics['vf_loss']:.4f} | "
                 f"entropy={metrics['entropy']:.4f} | "
@@ -657,11 +682,31 @@ def run_train(args):
     pbar.close()
     trainer.save(os.path.join(args.save_dir, "smacv2_tarmac_latest.pt"))
 
+    elapsed_total = time.time() - t_start
     save_plot(all_rewards, all_wins, args.save_dir)
-    results = {"rewards": all_rewards, "wins": all_wins, "total_steps": steps_done}
+    results = {
+        "algorithm": "TarMAC",
+        "race": args.race,
+        "scenario": f"{args.n_units}v{args.n_enemies}",
+        "total_steps": steps_done,
+        "wall_clock_seconds": elapsed_total,
+        "rollout_steps": args.rollout_steps,
+        "comm_dim": args.comm_dim,
+        "comm_rounds": args.comm_rounds,
+        "final_win_rate": float(np.mean(all_wins[-10:])) if all_wins else 0.0,
+        "final_mean_reward": float(np.mean(all_rewards[-10:])) if all_rewards else 0.0,
+        "peak_rolling20_win_rate": float(max(
+            np.mean(all_wins[max(0, i-19):i+1])
+            for i in range(len(all_wins))
+        )) if all_wins else 0.0,
+        "rewards": all_rewards,
+        "win_rate_history": all_wins,
+        "steps_history": all_steps,
+        "wall_clock_history": all_times,
+    }
     with open(os.path.join(args.save_dir, "smacv2_tarmac_results.json"), "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\nTraining complete! {steps_done} steps in {time.time()-t_start:.1f}s")
+    print(f"\nTraining complete! {steps_done} steps in {elapsed_total:.1f}s")
     env.close()
 
 

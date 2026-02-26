@@ -809,6 +809,16 @@ def run_train(args):
             plot_path,
         )
 
+    # Compute rolling-20 win rate history (per episode)
+    roll20_wr = [
+        float(np.mean(log_win_rates[max(0, i - 19): i + 1]))
+        for i in range(len(log_win_rates))
+    ]
+    peak_roll20 = float(max(roll20_wr)) if roll20_wr else 0.0
+
+    # Wall-clock time at each logged episode
+    log_wall_clock = [elapsed * s / max(total_steps, 1) for s in log_steps]
+
     # Save results JSON
     results = {
         "algorithm": "MADDPG",
@@ -817,8 +827,14 @@ def run_train(args):
         "race": args.race,
         "scenario": f"{args.n_units}v{args.n_enemies}",
         "total_episodes": episode_count,
+        "rollout_steps": "off-policy",
         "final_mean_reward": float(np.mean(log_rewards[-20:])) if log_rewards else 0.0,
         "final_win_rate":    float(np.mean(log_win_rates[-20:])) if log_win_rates else 0.0,
+        "peak_rolling20_win_rate": peak_roll20,
+        "win_rate_history": log_win_rates,
+        "steps_history":    log_steps,
+        "wall_clock_history": log_wall_clock,
+        "rewards_history":  log_rewards,
     }
     results_path = os.path.join(args.save_dir, "smacv2_maddpg_results.json")
     with open(results_path, "w") as f:

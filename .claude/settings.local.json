@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(echo:*)",
+      "Bash(python3:*)",
+      "Bash(# Check if smacv2 is installed in any Python env which python3 && python3 --version pip3 list)",
+      "Bash(conda list:*)",
+      "Bash(/usr/local/bin/python3.9:*)",
+      "Bash(/opt/homebrew/bin/python3:*)",
+      "Bash(python3.9:*)",
+      "WebFetch(domain:arxiv.org)"
+    ]
+  }
+}
