@@ -229,6 +229,8 @@ class TarMACActorCritic(nn.Module):
         attn = F.softmax(scores, dim=-1)   # (B, N, N)
         attn = torch.nan_to_num(attn, nan=0.0)  # guard all-inf rows (N=1 edge case)
 
+        self.last_attention = attn.detach().clone() # Store for visualization
+
         context = torch.bmm(attn, values)  # (B, N, C)
 
         if squeeze:
@@ -744,6 +746,7 @@ def run_eval(args):
         env.reset()
         terminated = False
         ep_reward  = 0.0
+        ep_attentions = []
 
         while not terminated:
             obs_list = env.get_obs()
@@ -759,6 +762,9 @@ def run_eval(args):
 
             reward, terminated, info = env.step(actions.cpu().numpy().tolist())
             ep_reward += reward
+            
+            if args.save_attention and hasattr(trainer.policy, 'last_attention'):
+                ep_attentions.append(trainer.policy.last_attention.cpu().numpy())
 
         won = info.get("battle_won", False)
         total_reward += ep_reward
@@ -767,6 +773,14 @@ def run_eval(args):
         print(f"  Episode {ep+1}/{args.eval_episodes}: reward={ep_reward:.2f}, won={won}")
 
     env.close()
+    
+    if args.save_attention and len(ep_attentions) > 0:
+        # Stack attentions over time: (T, B, N, N) -> (T, N, N) since B=1 in eval
+        att_stacked = np.stack(ep_attentions).squeeze(1) 
+        att_mean = np.mean(att_stacked, axis=0) # Average over episode time (N, N)
+        np.save(args.save_attention, att_mean)
+        print(f"Saved average episode attention weights to {args.save_attention}")
+        
     print(f"\nEvaluation Results ({args.eval_episodes} episodes):")
     print(f"  Mean reward: {total_reward / args.eval_episodes:.2f}")
     print(f"  Win rate:    {wins / args.eval_episodes:.2%}")
@@ -803,6 +817,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-grad-norm",   type=float, default=10.0)
     p.add_argument("--update-epochs",   type=int,   default=4)
     p.add_argument("--num-mini-batches",type=int,   default=4)
+
+    # Eval specific
+    p.add_argument("--save-attention",  type=str, default=None,
+                   help="Path to save attention weights (eval mode only)")
     p.add_argument("--hidden-dim",      type=int,   default=128)
     p.add_argument("--total-steps",     type=int,   default=500_000)
     p.add_argument("--rollout-steps",   type=int,   default=200)

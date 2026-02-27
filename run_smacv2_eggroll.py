@@ -180,6 +180,35 @@ class EGGROLLPolicy(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+class PretrainedAdapter(nn.Module):
+    """Wraps MAPPO/TarMAC policy to expose EGGROLL compatible interface."""
+    def __init__(self, base_policy):
+        super().__init__()
+        self.base_policy = base_policy
+        # Only optimize parameters used during rollout (ignore critic)
+        # Note: MAPPO has `actor`, TarMAC has `encoder`, `actor`, `key_head`, etc.
+        self.opt_params = [
+            p for n, p in self.base_policy.named_parameters() 
+            if "critic" not in n and p.requires_grad
+        ]
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.base_policy.get_actor_output(obs)
+
+    def get_flat_params(self) -> torch.Tensor:
+        return torch.cat([p.data.view(-1) for p in self.opt_params])
+
+    def set_flat_params(self, flat: torch.Tensor) -> None:
+        idx = 0
+        for p in self.opt_params:
+            n = p.numel()
+            p.data.copy_(flat[idx: idx + n].view(p.shape))
+            idx += n
+
+    @property
+    def n_params(self) -> int:
+        return sum(p.numel() for p in self.opt_params)
+
 # ===========================================================================
 # Low-rank perturbation helpers  (core EGGROLL contribution)
 # ===========================================================================
@@ -261,6 +290,12 @@ def rollout_episode(
 
         reward, terminated, info = env.step(actions.tolist())
         episode_reward += reward
+        
+        # Save attention if using TarMAC
+        if hasattr(policy, 'base_policy') and hasattr(policy.base_policy, 'last_attention'):
+            # Using policy.last_attention list passed from eval
+            if hasattr(policy, 'collect_attention'):
+                policy.collect_attention.append(policy.base_policy.last_attention.cpu().numpy())
 
         if terminated:
             won = bool(info.get("battle_won", False))
@@ -323,8 +358,20 @@ class EGGROLLTrainer:
         self.obs_dim   = env_info["obs_shape"]
 
         # Mean parameters θ (the policy we optimize)
-        self.policy = EGGROLLPolicy(self.obs_dim, self.n_actions, hidden_dim).to(device)
-        self._param_shapes = [p.shape for p in self.policy.parameters()]
+        self.pretrain_algo = getattr(env, "pretrain_algo", None)
+        if self.pretrain_algo == "mappo":
+            from run_smacv2_mappo import MAPPOActorCritic
+            # Add state_dim as it is expected. Here we use a dummy 1 since it is unused.
+            base_policy = MAPPOActorCritic(self.obs_dim, 1, self.n_actions, hidden_dim).to(device)
+            self.policy = PretrainedAdapter(base_policy)
+        elif self.pretrain_algo == "tarmac":
+            from run_smacv2_tarmac import TarMACActorCritic
+            base_policy = TarMACActorCritic(self.obs_dim, 1, self.n_actions, hidden_dim).to(device)
+            self.policy = PretrainedAdapter(base_policy)
+        else:
+            self.policy = EGGROLLPolicy(self.obs_dim, self.n_actions, hidden_dim).to(device)
+            
+        self._param_shapes = [p.shape for p in (self.policy.opt_params if hasattr(self.policy, "opt_params") else self.policy.parameters())]
         self._n_params = self.policy.n_params
 
         if antithetic:
@@ -412,13 +459,13 @@ class EGGROLLTrainer:
         shaped = self._normalize_fitnesses(fitnesses_arr)
 
         # --- 3. EGGROLL parameter update ---
-        # M_{t+1} = M_t + α · (1/N) Σ_i E_i · f̃_i
+        # M_{t+1} = M_t + α · (1/(N*σ)) Σ_i E_i · f̃_i
         update_vec = torch.zeros(self._n_params, device=self.device)
         for flat_E, f_shaped in zip(flat_Es, shaped):
             update_vec += flat_E * float(f_shaped)
         update_vec /= len(flat_Es)
 
-        new_params = base_params + self.lr * update_vec
+        new_params = base_params + self.lr * (update_vec / self.sigma)
         self.policy.set_flat_params(new_params)
 
         win_rate = win_count / max(episode_count, 1)
@@ -429,24 +476,39 @@ class EGGROLLTrainer:
             "std_fitness":   float(fitnesses_arr.std()),
             "win_rate":      win_rate,
             "update_norm":   float(update_vec.norm().item()),
-            "param_norm":    float(new_params.norm().item()),
+            "param_norm":    float(self.policy.get_flat_params().norm().item()),
         }
 
     # ------------------------------------------------------------------
     def save(self, path: str) -> None:
         torch.save({
-            "policy_state": self.policy.state_dict(),
+            "policy_state": self.policy.base_policy.state_dict() if hasattr(self.policy, "base_policy") else self.policy.state_dict(),
             "obs_dim":      self.obs_dim,
             "n_actions":    self.n_actions,
             "n_agents":     self.n_agents,
             "rank":         self.rank,
             "sigma":        self.sigma,
             "lr":           self.lr,
+            "pretrain_algo": self.pretrain_algo,
         }, path)
 
     def load(self, path: str) -> None:
-        ckpt = torch.load(path, map_location=self.device)
-        self.policy.load_state_dict(ckpt["policy_state"])
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        if "policy" in ckpt:
+            state_key = "policy"
+        elif "policy_state_dict" in ckpt:
+            state_key = "policy_state_dict"
+        else:
+            state_key = "policy_state"
+            
+        state_dict_to_load = ckpt[state_key]
+        
+        if hasattr(self.policy, "base_policy"):
+            # Filter out critic keys to avoid shape mismatches with our dummy state_dim
+            state_dict_to_load = {k: v for k, v in state_dict_to_load.items() if "critic" not in k}
+            self.policy.base_policy.load_state_dict(state_dict_to_load, strict=False)
+        else:
+            self.policy.load_state_dict(state_dict_to_load)
 
 
 # ===========================================================================
@@ -495,6 +557,7 @@ def run_train(args) -> None:
 
     device = torch.device("cpu")
     env = make_env(args.race, args.n_units, args.n_enemies)
+    env.pretrain_algo = args.pretrain_algo
 
     trainer = EGGROLLTrainer(
         env        = env,
@@ -627,28 +690,75 @@ def run_eval(args) -> None:
     env    = make_env(args.race, args.n_units, args.n_enemies, render=args.render)
 
     # Reconstruct policy shape from checkpoint
-    ckpt = torch.load(args.load_path, map_location=device)
-    policy = EGGROLLPolicy(
-        obs_dim    = ckpt["obs_dim"],
-        n_actions  = ckpt["n_actions"],
-        hidden_dim = args.hidden_dim,
-    ).to(device)
-    policy.load_state_dict(ckpt["policy_state"])
-    policy.eval()
+    ckpt = torch.load(args.load_path, map_location=device, weights_only=False)
+    
+    if "policy" in ckpt:
+        state_key = "policy"
+    elif "policy_state_dict" in ckpt:
+        state_key = "policy_state_dict"
+    else:
+        state_key = "policy_state"
 
-    n_agents  = ckpt["n_agents"]
-    n_actions = ckpt["n_actions"]
+    pretrain_algo = args.pretrain_algo if args.pretrain_algo else ckpt.get("pretrain_algo", None)
+    
+    if pretrain_algo == "mappo":
+        from run_smacv2_mappo import MAPPOActorCritic
+        # Need to parse obs_dim from ckpt since MAPPO checkpoints don't save obs_dim explicitly
+        obs_dim = ckpt[state_key]["actor.0.weight"].shape[1]
+        n_actions = ckpt[state_key]["actor.4.weight"].shape[0]
+        n_agents = args.n_units # best guess
+        base_policy = MAPPOActorCritic(obs_dim, 1, n_actions, args.hidden_dim).to(device)
+        state_dict_to_load = {k: v for k, v in ckpt[state_key].items() if "critic" not in k}
+        base_policy.load_state_dict(state_dict_to_load, strict=False)
+        policy = PretrainedAdapter(base_policy)
+    elif pretrain_algo == "tarmac":
+        from run_smacv2_tarmac import TarMACActorCritic
+        obs_dim = ckpt[state_key]["encoder.0.weight"].shape[1]
+        n_actions = ckpt[state_key]["actor.2.weight"].shape[0]
+        n_agents = args.n_units
+        base_policy = TarMACActorCritic(obs_dim, 1, n_actions, args.hidden_dim).to(device)
+        state_dict_to_load = {k: v for k, v in ckpt[state_key].items() if "critic" not in k}
+        base_policy.load_state_dict(state_dict_to_load, strict=False)
+        policy = PretrainedAdapter(base_policy)
+    else:
+        policy = EGGROLLPolicy(
+            obs_dim    = ckpt["obs_dim"],
+            n_actions  = ckpt["n_actions"],
+            hidden_dim = args.hidden_dim,
+        ).to(device)
+        policy.load_state_dict(ckpt["policy_state"])
+        n_agents = ckpt["n_agents"]
+        n_actions = ckpt["n_actions"]
+        
+    policy.eval()
 
     total_reward = 0.0
     wins = 0
+    ep_attentions = []
     for ep in range(args.eval_episodes):
+        
+        # Pass a list to collect attention matrices during this rollout
+        if args.save_attention and pretrain_algo == "tarmac":
+            policy.collect_attention = []
+            
         r, won = rollout_episode(
             env, policy, n_agents, n_actions, device, args.max_episode_steps
         )
         total_reward += r
         wins += int(won)
+        
+        if args.save_attention and pretrain_algo == "tarmac":
+            ep_attentions.extend(policy.collect_attention)
+            
         print(f"  Episode {ep + 1}: reward={r:.2f}, won={won}")
 
+    if args.save_attention and len(ep_attentions) > 0:
+        # Stack attentions over time: (T, B, N, N) -> (T, N, N)
+        att_stacked = np.stack(ep_attentions).squeeze(1) 
+        att_mean = np.mean(att_stacked, axis=0) # Average over episode time (N, N)
+        np.save(args.save_attention, att_mean)
+        print(f"Saved average episode attention weights to {args.save_attention}")
+        
     print(f"\nMean reward: {total_reward / args.eval_episodes:.2f}")
     print(f"Win rate:    {wins / args.eval_episodes:.1%}")
     env.close()
@@ -663,6 +773,7 @@ def run_test(args) -> None:
     print(f"=== EGGROLL Smoke Test: {args.race} {args.n_units}v{args.n_enemies} ===")
     device = torch.device("cpu")
     env    = make_env(args.race, args.n_units, args.n_enemies)
+    env.pretrain_algo = args.pretrain_algo
 
     # Minimal trainer: pop=4, rank=1, 1 update of up to 10 steps per episode
     trainer = EGGROLLTrainer(
@@ -734,10 +845,14 @@ def main() -> None:
                    help="Save checkpoint every N updates")
     p.add_argument("--save-dir",          default="checkpoints/smacv2_eggroll")
     p.add_argument("--load-path",         default=None)
+    p.add_argument("--pretrain-algo",     default=None, choices=["mappo", "tarmac"],
+                   help="If specified, use this architecture and load its weights (e.g. fine-tune MAPPO/TarMAC)")
 
     # Eval
     p.add_argument("--eval-episodes", type=int, default=20)
     p.add_argument("--render",        action="store_true")
+    p.add_argument("--save-attention",type=str, default=None,
+                   help="Path to save attention weights (eval mode only)")
 
     # Smoke test
     p.add_argument("--test-episodes", type=int, default=1)

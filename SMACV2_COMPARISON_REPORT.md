@@ -20,36 +20,29 @@ This report compares three multi-agent RL algorithms on SMACv2 Terran 5v5:
 
 ---
 
-## SMACv2 Results (Step-Matched, 10k steps, Terran 5v5)
+## SMACv2 Results (Step-Matched, 200k steps, Terran 5v5)
 
 ### Training summary
 
-| Metric | MAPPO | TarMAC |
-|--------|-------|--------|
-| Total env steps | 10,000 | 10,000 |
-| Wall-clock time | **343.3 s** | 483.0 s |
-| Mean reward (all updates) | 4.34 | **21.99** |
-| Mean reward (last 10 updates) | 6.35 | **27.98** |
-| Best single-update reward | 8.85 | **41.48** |
-| Final win rate (last 20 updates) | 1% | **5%** |
-| Final entropy | 0.744 | 0.769 |
-| Final pg_loss | -0.003 | -0.012 |
-| Final vf_loss | 0.469 | 0.407 |
-
-### Reward trajectory (per-update, 200 steps/update)
-
-```
-MAPPO  rewards (updates 1→50, roughly): 1.2 → 2.1 → ... → 8.5 → 5.1   (monotone slow rise)
-TarMAC rewards (updates 1→50, roughly): 12.1 → 19.1 → ... → 34.9 → 19.1 (faster, higher plateau)
-```
+| Metric | MAPPO | TarMAC | MAPPO + EGGROLL | TarMAC + EGGROLL (Tuned) | EGGROLL (Scratch) | MADDPG |
+|--------|-------|--------|-----------------|--------------------------|-------------------|--------|
+| Total env steps | 200,000 | 200,000 | 201,600 | 204,800 | 204,800 | 200,000 |
+| Wall-clock time | 2118.1 s | 2190.3 s | 465.0 s | 406.4 s | **382.4 s** | 2228.0 s |
+| Final mean reward | 9.58 | **110.84** | 9.38 | 10.23 | 1.81 | 5.52 |
+| Final win rate | 12.1% | **25.4%** | 5.6% | 11.6% | 0.0% | 5.0% |
+| Peak 20-ep win rate | 16.9% | 27.5% | 10.9% | 15.1% | 0.0% | 10.0% |
+| Final entropy | 0.264 | N/A | N/A (ES) | N/A (ES) | N/A (ES) | N/A |
+| Final pg_loss | -0.002 | N/A | N/A (ES) | N/A (ES) | N/A (ES) | -28.91 (actor) |
+| Final vf_loss | 1.157 | N/A | N/A (ES) | N/A (ES) | N/A (ES) | 191.80 (critic) |
 
 ### Key observations
 
-1. **TarMAC achieves 4-5× higher mean reward** than MAPPO at equal step budgets (21.99 vs 4.34).
-2. **Win rate is low for both** — 5% vs 1% after only 10k steps. SMACv2 requires substantially more training (hundreds of thousands of steps) for high win rates. These numbers reflect early-training behaviour.
-3. **MAPPO is 29% faster wall-clock** (343 s vs 483 s) because TarMAC's attention-based communication adds per-step overhead.
-4. **TarMAC's loss metrics are healthy**: pg_loss ~-0.012, entropy 0.77 (still exploring), vf_loss 0.41. MAPPO shows lower absolute pg_loss (-0.003) which may indicate slower policy improvement early in training.
-5. **Reward trends diverge late:** TarMAC rewards trend upward in the second half of training (steps 6k-10k: mean ~27 vs first-half ~16), while MAPPO trends flatten and remain low.
+1. **TarMAC achieves ~11.5× higher final mean reward** than MAPPO at equal 200k step budgets (110.84 vs 9.58).
+2. **Win rate advantage for TarMAC**: TarMAC reaches a final win rate of **25.4%**, which is more than double MAPPO's **12.1%**.
+3. **EGGROLL Fine-tuning Degradation:** Applying EGGROLL on top of the MAPPO and TarMAC checkpoints over an additional 200k steps *degraded* the win-rates (from 12.1% to 5.6% for MAPPO, and from 25.4% to 11.6% for TarMAC).
+   * Note on hyper-parameter tuning: Even with hyper-parameters tuned for this specific architecture (`pop_size=64`, `rank=8`, `lr=1e-4`, `sigma=0.05`), EGGROLL was unable to improve the TarMAC checkpoint. The global ES updates seemingly struggled to maintain or improve the highly specialized critic-guided behaviors learned by PPO within this densely connected architecture.
+4. **EGGROLL From-Scratch:** Pure ES on a random initialization struggles to learn a coordinated combat policy within 200k steps, achieving a 0.0% win rate and a final mean reward of ~1.81. This is consistent with general RL literature that pure zeroth-order black-box optimization has high sample complexity in dense deep-RL (SMAC) without a value critic guiding the gradient directions. However, as the paper claims, it is undeniably blazing fast, taking only ~382 seconds to complete 200k steps.
+5. **MADDPG struggles in SMACv2**: Similar to previous literature on fully decentralised/off-policy algorithms in SMAC, MADDPG performs worst out of the base actor-critic algorithms at 200k steps (5.0% win rate), and its wall-clock time is highest (2228s) due to maintaining replay buffers and individual critics per agent.
 
 ---
 
