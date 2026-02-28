@@ -217,43 +217,37 @@ def sample_lowrank_perturbation(
     param_shapes: List[Tuple[int, ...]],
     rank: int,
     device: torch.device,
-) -> Tuple[List[Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
-    """Sample one rank-r perturbation E = (1/√r) A B^T for each parameter tensor.
+) -> torch.Tensor:
+    """Sample EGGROLL perturbation E for each parameter tensor.
 
-    For 2-D parameters (weight matrices) we sample:
+    For 2-D parameters (weight matrices) we sample low-rank:
         A ∈ R^{m×r},  B ∈ R^{n×r}
         E = (1/√r) A B^T  ∈ R^{m×n}
 
-    For 1-D parameters (bias vectors of length d) we treat them as (d,1)
-    matrices:
-        A ∈ R^{d×r},  B ∈ R^{1×r}
-        E = (1/√r) A B^T  ∈ R^{d×1}  -> reshaped to (d,)
+    For 1-D parameters (bias vectors of length d) we sample full-rank:
+        E ~ N(0, I) ∈ R^d
 
     Returns
     -------
-    factors : list of (A, B) tensors, one per parameter tensor
     flat_E  : the full concatenated flat perturbation vector (same shape as
               get_flat_params()) — used for the parameter update step.
     """
-    factors: List[Tuple[torch.Tensor, torch.Tensor]] = []
     flat_parts: List[torch.Tensor] = []
 
     for shape in param_shapes:
         if len(shape) >= 2:
             m = shape[0]
             n = int(np.prod(shape[1:]))          # flatten remaining dims
+            A = torch.randn(m, rank, device=device)
+            B = torch.randn(n, rank, device=device)
+            E = (1.0 / (rank ** 0.5)) * (A @ B.T)   # (m, n)
+            flat_parts.append(E.view(-1))
         else:
-            m = shape[0]
-            n = 1
-
-        A = torch.randn(m, rank, device=device)
-        B = torch.randn(n, rank, device=device)
-        E = (1.0 / (rank ** 0.5)) * (A @ B.T)   # (m, n)
-        factors.append((A, B))
-        flat_parts.append(E.view(-1))
+            E = torch.randn(shape, device=device)
+            flat_parts.append(E.view(-1))
 
     flat_E = torch.cat(flat_parts)               # (total_params,)
-    return factors, flat_E
+    return flat_E
 
 
 # ===========================================================================
@@ -374,6 +368,9 @@ class EGGROLLTrainer:
         self._param_shapes = [p.shape for p in (self.policy.opt_params if hasattr(self.policy, "opt_params") else self.policy.parameters())]
         self._n_params = self.policy.n_params
 
+        params_iterator = self.policy.opt_params if hasattr(self.policy, "opt_params") else self.policy.parameters()
+        self.optimizer = torch.optim.Adam(params_iterator, lr=self.lr)
+
         if antithetic:
             assert pop_size % 2 == 0, "pop_size must be even when antithetic=True"
 
@@ -421,8 +418,8 @@ class EGGROLLTrainer:
         n_positive = self.pop_size if not self.antithetic else self.pop_size // 2
 
         for i in range(n_positive):
-            # Sample rank-r perturbation for each parameter tensor
-            _, flat_E = sample_lowrank_perturbation(
+            # Sample perturbation for each parameter tensor
+            flat_E = sample_lowrank_perturbation(
                 self._param_shapes, self.rank, self.device
             )
 
@@ -459,14 +456,27 @@ class EGGROLLTrainer:
         shaped = self._normalize_fitnesses(fitnesses_arr)
 
         # --- 3. EGGROLL parameter update ---
-        # M_{t+1} = M_t + α · (1/(N*σ)) Σ_i E_i · f̃_i
         update_vec = torch.zeros(self._n_params, device=self.device)
         for flat_E, f_shaped in zip(flat_Es, shaped):
             update_vec += flat_E * float(f_shaped)
         update_vec /= len(flat_Es)
 
-        new_params = base_params + self.lr * (update_vec / self.sigma)
-        self.policy.set_flat_params(new_params)
+        # Official HyperscaleES repo uses a pseudo-gradient passed to an optimizer (like Adam).
+        # The exact pseudo-gradient scaling derived from their notebook: g = -sigma * sqrt(N) * update_vec
+        N = len(flat_Es)
+        pseudo_grad = -self.sigma * (N ** 0.5) * update_vec
+
+        self.optimizer.zero_grad()
+        
+        # Populate .grad for each parameter using the flattened pseudo-gradient
+        idx = 0
+        params_iterator = self.policy.opt_params if hasattr(self.policy, "opt_params") else self.policy.parameters()
+        for p in params_iterator:
+            n = p.numel()
+            p.grad = pseudo_grad[idx: idx + n].view(p.shape).clone()
+            idx += n
+            
+        self.optimizer.step()
 
         win_rate = win_count / max(episode_count, 1)
         return {

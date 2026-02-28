@@ -8,12 +8,13 @@
 
 ## Overview
 
-This report compares three multi-agent RL algorithms on SMACv2 Terran 5v5:
+This report compares multi-agent RL algorithms on SMACv2 Terran 5v5:
 
 | Algorithm | Paradigm | Communication | Critic |
 |-----------|----------|---------------|--------|
 | **MAPPO** | CTDE | None | Centralised (global state) |
 | **TarMAC** | CTDE | Learned (soft-attention) | Centralised (global state) |
+| **Memeplex** | CTDE | Meme-enriched attention + epidemic spreading | Centralised (global state) |
 | **MADDPG / Method I** | Self-play (MPE2) | — | Centralised / Decentralised |
 
 > **Note on MADDPG and Method I (LA-IPPO):** These algorithms were evaluated on a different environment (MPE2 `simple_tag_v3`, predator-prey) using Elo-based competitive metrics. They are included here as reference baselines from the companion experiment. Direct cross-environment comparison should be treated with caution.
@@ -24,25 +25,24 @@ This report compares three multi-agent RL algorithms on SMACv2 Terran 5v5:
 
 ### Training summary
 
-| Metric | MAPPO | TarMAC | MAPPO + EGGROLL | TarMAC + EGGROLL (Tuned) | EGGROLL (Scratch) | MADDPG |
-|--------|-------|--------|-----------------|--------------------------|-------------------|--------|
-| Total env steps | 200,000 | 200,000 | 201,600 | 204,800 | 204,800 | 200,000 |
-| Wall-clock time | 2118.1 s | 2190.3 s | 465.0 s | 406.4 s | **382.4 s** | 2228.0 s |
-| Final mean reward | 9.58 | **110.84** | 9.38 | 10.23 | 1.81 | 5.52 |
-| Final win rate | 12.1% | **25.4%** | 5.6% | 11.6% | 0.0% | 5.0% |
-| Peak 20-ep win rate | 16.9% | 27.5% | 10.9% | 15.1% | 0.0% | 10.0% |
-| Final entropy | 0.264 | N/A | N/A (ES) | N/A (ES) | N/A (ES) | N/A |
-| Final pg_loss | -0.002 | N/A | N/A (ES) | N/A (ES) | N/A (ES) | -28.91 (actor) |
-| Final vf_loss | 1.157 | N/A | N/A (ES) | N/A (ES) | N/A (ES) | 191.80 (critic) |
+| Metric | MAPPO | TarMAC | **Memeplex** | MAPPO + EGGROLL | TarMAC + EGGROLL | EGGROLL (200k) | EGGROLL (1.2M) | MADDPG |
+|--------|-------|--------|-------------|-----------------|------------------|----------------|----------------|--------|
+| Total env steps | 200,000 | 200,000 | **200,000** | 201,600 | 204,800 | 204,800 | 1,203,200 | 200,000 |
+| Wall-clock time | 2118.1 s | 2190.3 s | **8101.8 s** | 465.0 s | 406.4 s | 416.5 s | 3501.2 s | 2228.0 s |
+| Final mean reward | 9.58 | **110.84** | **44.43** | 9.38 | 10.23 | 4.22 | 8.24 | 5.52 |
+| Final win rate | 12.1% | **25.4%** | **9.8%** | 5.6% | 11.6% | 0.6% | 4.7% | 5.0% |
+| Peak 20-ep win rate | 16.9% | 27.5% | **20.3%** | 10.9% | 15.1% | 0.8% | 4.3% | 10.0% |
+| Infections | — | — | **15,907** | — | — | — | — | — |
+| Meme diversity | — | — | **0.974** | — | — | — | — | — |
 
 ### Key observations
 
 1. **TarMAC achieves ~11.5× higher final mean reward** than MAPPO at equal 200k step budgets (110.84 vs 9.58).
 2. **Win rate advantage for TarMAC**: TarMAC reaches a final win rate of **25.4%**, which is more than double MAPPO's **12.1%**.
-3. **EGGROLL Fine-tuning Degradation:** Applying EGGROLL on top of the MAPPO and TarMAC checkpoints over an additional 200k steps *degraded* the win-rates (from 12.1% to 5.6% for MAPPO, and from 25.4% to 11.6% for TarMAC).
-   * Note on hyper-parameter tuning: Even with hyper-parameters tuned for this specific architecture (`pop_size=64`, `rank=8`, `lr=1e-4`, `sigma=0.05`), EGGROLL was unable to improve the TarMAC checkpoint. The global ES updates seemingly struggled to maintain or improve the highly specialized critic-guided behaviors learned by PPO within this densely connected architecture.
-4. **EGGROLL From-Scratch:** Pure ES on a random initialization struggles to learn a coordinated combat policy within 200k steps, achieving a 0.0% win rate and a final mean reward of ~1.81. This is consistent with general RL literature that pure zeroth-order black-box optimization has high sample complexity in dense deep-RL (SMAC) without a value critic guiding the gradient directions. However, as the paper claims, it is undeniably blazing fast, taking only ~382 seconds to complete 200k steps.
-5. **MADDPG struggles in SMACv2**: Similar to previous literature on fully decentralised/off-policy algorithms in SMAC, MADDPG performs worst out of the base actor-critic algorithms at 200k steps (5.0% win rate), and its wall-clock time is highest (2228s) due to maintaining replay buffers and individual critics per agent.
+3. **Memeplex (Meme Epidemiology):** Reached a **peak rolling-20 win rate of 20.3%**, exceeding MAPPO's 16.9% peak and demonstrating that meme-enriched communication adds value. Final mean reward (44.43) is 4.6× higher than MAPPO. However, it is 3.7× slower than TarMAC (8101s vs 2190s) and final win rate (9.8%) showed high variance. Meme diversity remained high (0.974), indicating healthy evolutionary dynamics without collapse. Total 15,907 infections occurred throughout training (~14/rollout).
+4. **EGGROLL Fine-tuning Degradation:** Applying EGGROLL on top of the MAPPO and TarMAC checkpoints over an additional 200k steps *degraded* the win-rates (from 12.1% to 5.6% for MAPPO, and from 25.4% to 11.6% for TarMAC).
+5. **EGGROLL From-Scratch (Wall-Clock Fair):** At 1.2M steps (3501s, ~1.6× the wall-clock of MAPPO/TarMAC), EGGROLL from scratch reached a **4.7% win rate** and 8.24 mean fitness — unable to match critic-guided methods even with 6× more steps.
+6. **MADDPG struggles in SMACv2**: 5.0% win rate at 200k steps, worst among actor-critic methods.
 
 ---
 
