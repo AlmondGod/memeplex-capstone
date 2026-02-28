@@ -134,64 +134,52 @@ def make_env(race: str, n_units: int, n_enemies: int, render: bool = False):
 
 
 # ===========================================================================
-# Meme Bank
+# Meme Bank  (vectorized: all N agents stored as (N, M) tensors)
 # ===========================================================================
 
-class MemeBank:
-    """Per-agent bank of M meme vectors with usage/fitness tracking."""
+class MemeBankVec:
+    """Vectorized meme tracker for ALL agents at once.
+    
+    Stores usage/fitness as (N, M) tensors for batched updates.
+    Immune memory remains per-agent (dict-based, sparse).
+    """
 
-    def __init__(self, n_memes: int, meme_dim: int, device: str = "cpu"):
+    def __init__(self, n_agents: int, n_memes: int, meme_dim: int, device: str = "cpu"):
+        self.n_agents = n_agents
         self.n_memes = n_memes
         self.meme_dim = meme_dim
         self.device = device
 
-        # Meme vectors are nn.Parameters (will be registered via the network)
-        # Usage and fitness tracked as plain tensors (not differentiable)
-        self.usage_ema = torch.zeros(n_memes, device=device)
-        self.fitness_ema = torch.zeros(n_memes, device=device)
-        
-        # Immune memory: maps meme hashes to immunity scores
-        self.immune_memory: Dict[str, float] = {}
+        self.usage_ema = torch.zeros(n_agents, n_memes, device=device)
+        self.fitness_ema = torch.zeros(n_agents, n_memes, device=device)
+        self.immune_memory: List[Dict[str, float]] = [{} for _ in range(n_agents)]
 
-    def update_usage(self, selection_weights: torch.Tensor, alpha: float = 0.05):
-        """Update EMA of usage from the selector's softmax weights.
-        selection_weights: (n_memes,) softmax distribution."""
+    def update_usage(self, sel_weights: torch.Tensor, alpha: float = 0.05):
+        """sel_weights: (N, M) softmax distribution per agent."""
         with torch.no_grad():
-            self.usage_ema = (1 - alpha) * self.usage_ema + alpha * selection_weights.detach()
+            self.usage_ema = (1 - alpha) * self.usage_ema + alpha * sel_weights.detach()
 
-    def update_fitness(self, selection_weights: torch.Tensor, reward: float, alpha: float = 0.1):
-        """Update EMA of fitness, weighted by how much each meme was selected."""
+    def update_fitness(self, sel_weights: torch.Tensor, reward: float, alpha: float = 0.1):
+        """Batch-update fitness EMA for all agents."""
         with torch.no_grad():
-            contribution = selection_weights.detach()  # (n_memes,)
-            self.fitness_ema = (1 - alpha) * self.fitness_ema + alpha * contribution * reward
-
-    def get_most_active_idx(self) -> int:
-        return int(self.usage_ema.argmax().item())
-
-    def get_least_used_idx(self) -> int:
-        return int(self.usage_ema.argmin().item())
+            self.fitness_ema = (
+                (1 - alpha) * self.fitness_ema
+                + alpha * sel_weights.detach() * reward
+            )
 
     def decay_immunity(self, decay: float = 0.99):
-        """Decay all immune memory entries."""
-        expired = []
-        for h, v in self.immune_memory.items():
-            self.immune_memory[h] = v * decay
-            if self.immune_memory[h] < 0.01:
-                expired.append(h)
-        for h in expired:
-            del self.immune_memory[h]
+        for agent_mem in self.immune_memory:
+            expired = [h for h, v in agent_mem.items() if v * decay < 0.01]
+            for h in expired:
+                del agent_mem[h]
+            for h in list(agent_mem.keys()):
+                agent_mem[h] *= decay
 
-    def get_immunity(self, meme_hash: str) -> float:
-        return self.immune_memory.get(meme_hash, 0.0)
-
-    def add_immunity(self, meme_hash: str, boost: float = 1.0):
-        self.immune_memory[meme_hash] = self.immune_memory.get(meme_hash, 0.0) + boost
-
-
-def meme_hash(meme_vec: torch.Tensor) -> str:
-    """Quick hash of a meme vector for immune memory."""
-    data = meme_vec.detach().cpu().numpy().tobytes()
-    return hashlib.md5(data).hexdigest()[:8]
+    def to(self, device):
+        self.device = device
+        self.usage_ema = self.usage_ema.to(device)
+        self.fitness_ema = self.fitness_ema.to(device)
+        return self
 
 
 # ===========================================================================
@@ -250,11 +238,8 @@ class MemeplexActorCritic(nn.Module):
             nn.Linear(hidden_dim // 2, n_memes),
         )
 
-        # Per-agent meme banks (nn.ParameterList of [n_memes, meme_dim])
-        self.meme_params = nn.ParameterList([
-            nn.Parameter(torch.randn(n_memes, meme_dim) * 0.1)
-            for _ in range(n_agents)
-        ])
+        # Single stacked meme bank: (N, M, D) — one batched parameter
+        self.meme_params = nn.Parameter(torch.randn(n_agents, n_memes, meme_dim) * 0.1)
 
         # Communication heads — messages include meme context
         self.key_head   = nn.Linear(hidden_dim + meme_dim, comm_dim)
@@ -279,10 +264,8 @@ class MemeplexActorCritic(nn.Module):
 
         self._init_weights()
 
-        # Create meme bank trackers (non-differentiable metadata)
-        self.meme_banks: List[MemeBank] = []
-        for i in range(n_agents):
-            self.meme_banks.append(MemeBank(n_memes, meme_dim))
+        # Vectorized meme bank tracker (non-differentiable metadata)
+        self.meme_bank = MemeBankVec(n_agents, n_memes, meme_dim)
 
     def _init_weights(self):
         for m in self.modules():
@@ -292,38 +275,23 @@ class MemeplexActorCritic(nn.Module):
 
     def select_memes(self, hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Select memes for each agent from their bank.
+        Vectorized meme selection for all agents via batched matmul.
 
-        Parameters
-        ----------
         hidden : (N, hidden_dim) or (B, N, hidden_dim)
-
-        Returns
-        -------
-        active_memes : same leading shape + (meme_dim,)
-        selection_weights : same leading shape + (n_memes,)
+        Returns: (active_memes, selection_weights)
         """
         squeeze = hidden.dim() == 2
         if squeeze:
             hidden = hidden.unsqueeze(0)  # (1, N, D)
 
         B, N, _ = hidden.shape
-        # Compute selector logits
-        logits = self.selector(hidden)  # (B, N, n_memes)
-        weights = F.softmax(logits, dim=-1)  # (B, N, n_memes)
+        logits = self.selector(hidden)           # (B, N, n_memes)
+        weights = F.softmax(logits, dim=-1)      # (B, N, n_memes)
 
-        # Weighted sum of each agent's meme bank
-        active_memes_list = []
-        for i in range(N):
-            # meme_params[i]: (n_memes, meme_dim)
-            # weights[:, i, :]: (B, n_memes)
-            agent_idx = i % len(self.meme_params)  # Handle if N varies
-            meme_bank = self.meme_params[agent_idx]  # (n_memes, meme_dim)
-            w = weights[:, i, :]  # (B, n_memes)
-            active = torch.matmul(w, meme_bank)  # (B, meme_dim)
-            active_memes_list.append(active)
-
-        active_memes = torch.stack(active_memes_list, dim=1)  # (B, N, meme_dim)
+        # meme_params: (N, M, D) — expand for batch dim
+        banks = self.meme_params.unsqueeze(0).expand(B, -1, -1, -1)  # (B, N, M, D)
+        w = weights.unsqueeze(-1)                # (B, N, M, 1)
+        active_memes = (banks * w).sum(dim=2)    # (B, N, D)
 
         if squeeze:
             active_memes = active_memes.squeeze(0)
@@ -405,72 +373,103 @@ class MemeplexActorCritic(nn.Module):
 
 
 # ===========================================================================
-# Infection Logic
+# Vectorized Infection Logic
 # ===========================================================================
 
-def attempt_infection(
-    sender_bank: MemeBank,
-    receiver_bank: MemeBank,
-    sender_meme_params: nn.Parameter,
-    receiver_meme_params: nn.Parameter,
-    attn_weight: float,
+def run_vectorized_infection(
+    meme_params: nn.Parameter,     # (N, M, D)
+    meme_bank: MemeBankVec,
+    attn: torch.Tensor,            # (N, N) attention matrix
     mutation_sigma: float = 0.1,
     immunity_boost: float = 1.0,
     virality_threshold: float = 0.0,
-) -> bool:
+    attn_min: float = 0.1,
+) -> int:
     """
-    Attempt to spread sender's most active meme to receiver.
-
-    Returns True if infection occurred.
+    Vectorized infection across all agent pairs.
+    Returns number of infections that occurred.
     """
-    # Get sender's most active meme
-    sender_idx = sender_bank.get_most_active_idx()
-    sender_meme = sender_meme_params.data[sender_idx].clone()
-    s_hash = meme_hash(sender_meme)
+    N, M, D = meme_params.shape
+    device = meme_params.device
+    infections = 0
 
-    # Compute virality = fitness × novelty - immunity
-    fitness = float(sender_bank.fitness_ema[sender_idx].item())
-
-    # Novelty = min cosine distance to any meme in receiver's bank
     with torch.no_grad():
-        cos_sims = F.cosine_similarity(
-            sender_meme.unsqueeze(0),        # (1, D)
-            receiver_meme_params.data,       # (M, D)
-            dim=-1
-        )  # (M,)
-        novelty = 1.0 - cos_sims.max().item()  # higher = more novel
+        # Sender's most active meme index per agent: (N,)
+        sender_idxs = meme_bank.usage_ema.argmax(dim=1)       # (N,)
+        # Gather sender memes: (N, D)
+        sender_memes = meme_params.data[torch.arange(N, device=device), sender_idxs]  # (N, D)
+        # Sender fitness for their most active meme: (N,)
+        sender_fitness = meme_bank.fitness_ema[torch.arange(N, device=device), sender_idxs]
 
-    # Immunity
-    immunity = receiver_bank.get_immunity(s_hash)
+        # Receiver's least used meme index per agent: (N,)
+        receiver_idxs = meme_bank.usage_ema.argmin(dim=1)     # (N,)
 
-    # Virality score
-    virality = (abs(fitness) + 0.1) * novelty * attn_weight - immunity
+        # Novelty: for each (receiver, sender) pair, compute max cosine sim
+        # sender_memes: (N, D) -> expand for each receiver's bank
+        # meme_params: (N, M, D)
+        # We want: for receiver i, sender j: cos_sim(sender_memes[j], meme_params[i])
+        sender_norm = F.normalize(sender_memes, dim=-1)       # (N, D)
+        bank_norm = F.normalize(meme_params.data, dim=-1)     # (N, M, D)
 
-    if virality < virality_threshold:
-        return False
+        # cos_sim[i, j, m] = dot(sender_norm[j], bank_norm[i, m])
+        # = (bank_norm[i] @ sender_norm[j].T) for all m
+        # bank_norm: (N, M, D), sender_norm: (N, D)
+        # Result shape: (N_recv, N_send)
+        cos_sim_max = torch.einsum('imd,jd->ij', bank_norm, sender_norm).max(dim=-1).values
+        # Wait - that gives (N, N) but einsum 'imd,jd->ij' sums over d, giving (N_i, N_j)
+        # but we want max over m. Let me fix:
+        # cos_sim[i, j, m] via einsum 'imd,jd->ijm'
+        cos_sim_all = torch.einsum('imd,jd->ijm', bank_norm, sender_norm)  # (N, N, M)
+        cos_sim_max = cos_sim_all.max(dim=-1).values  # (N, N) — max sim for recv i from sender j
+        novelty = 1.0 - cos_sim_max  # (N, N)
 
-    # Infection probability
-    prob = torch.sigmoid(torch.tensor(virality)).item()
-    if random.random() > prob:
-        return False
+        # Fitness term: (N,) -> broadcast to (N, N)
+        fitness_term = (sender_fitness.abs() + 0.1).unsqueeze(0).expand(N, -1)  # (N_recv, N_send)
 
-    # --- Infection occurs! ---
-    # Mutate the meme
-    mutated_meme = sender_meme + torch.randn_like(sender_meme) * mutation_sigma
+        # Virality: (N, N)
+        virality = fitness_term * novelty * attn
 
-    # Replace receiver's least-used meme
-    replace_idx = receiver_bank.get_least_used_idx()
-    with torch.no_grad():
-        receiver_meme_params.data[replace_idx] = mutated_meme
+        # Subtract immunity (per-pair, sparse — need loop but only over active pairs)
+        # Mask: self-attention=0, low attention=0
+        mask = (attn > attn_min)
+        mask.fill_diagonal_(False)
 
-    # Reset usage/fitness for the new meme
-    receiver_bank.usage_ema[replace_idx] = 0.0
-    receiver_bank.fitness_ema[replace_idx] = 0.0
+        # Get candidate pairs
+        recv_ids, send_ids = torch.where(mask)
 
-    # Add immune memory
-    receiver_bank.add_immunity(s_hash, immunity_boost)
+        if len(recv_ids) == 0:
+            return 0
 
-    return True
+        # Process candidates
+        for k in range(len(recv_ids)):
+            i = recv_ids[k].item()
+            j = send_ids[k].item()
+
+            # Get immunity for this specific meme
+            s_meme = sender_memes[j]
+            s_hash = hashlib.md5(s_meme.cpu().numpy().tobytes()).hexdigest()[:8]
+            immunity = meme_bank.immune_memory[i].get(s_hash, 0.0)
+
+            v = virality[i, j].item() - immunity
+            if v < virality_threshold:
+                continue
+
+            prob = torch.sigmoid(torch.tensor(v)).item()
+            if random.random() > prob:
+                continue
+
+            # Infection occurs!
+            mutated = s_meme + torch.randn_like(s_meme) * mutation_sigma
+            replace_idx = receiver_idxs[i].item()
+            meme_params.data[i, replace_idx] = mutated
+            meme_bank.usage_ema[i, replace_idx] = 0.0
+            meme_bank.fitness_ema[i, replace_idx] = 0.0
+            meme_bank.immune_memory[i][s_hash] = (
+                meme_bank.immune_memory[i].get(s_hash, 0.0) + immunity_boost
+            )
+            infections += 1
+
+    return infections
 
 
 # ===========================================================================
@@ -594,10 +593,7 @@ class MemeplexTrainer:
         ).to(device)
 
         # Move meme bank device references
-        for bank in self.policy.meme_banks:
-            bank.device = device
-            bank.usage_ema = bank.usage_ema.to(device)
-            bank.fitness_ema = bank.fitness_ema.to(device)
+        self.policy.meme_bank.to(device)
 
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr, eps=1e-5)
         self.buffer    = RolloutBuffer()
@@ -631,9 +627,8 @@ class MemeplexTrainer:
 
         reward, terminated, info = self.env.step(actions.cpu().numpy().tolist())
 
-        # Update meme usage tracking for each agent
-        for i in range(self.n_agents):
-            self.policy.meme_banks[i].update_usage(sel_weights[i], self.usage_ema_alpha)
+        # Vectorized usage update for all agents at once
+        self.policy.meme_bank.update_usage(sel_weights, self.usage_ema_alpha)
 
         self.buffer.add(
             obs         = obs_arr,
@@ -649,42 +644,24 @@ class MemeplexTrainer:
         return reward, terminated, info, sel_weights
 
     def _run_infection_step(self):
-        """Attempt meme infection between agents based on attention weights."""
+        """Vectorized meme infection between agents based on attention weights."""
         if not hasattr(self.policy, 'last_attention'):
             return 0
 
-        attn = self.policy.last_attention  # (B, N, N) or (1, N, N)
+        attn = self.policy.last_attention
         if attn.dim() == 3:
             attn = attn.squeeze(0)  # (N, N)
 
-        infections = 0
-        N = self.n_agents
+        infections = run_vectorized_infection(
+            meme_params=self.policy.meme_params,
+            meme_bank=self.policy.meme_bank,
+            attn=attn,
+            mutation_sigma=self.mutation_sigma,
+            immunity_boost=self.immunity_boost,
+            virality_threshold=self.virality_threshold,
+        )
 
-        for i in range(N):  # receiver
-            for j in range(N):  # sender
-                if i == j:
-                    continue
-                a_ij = attn[i, j].item()
-                if a_ij < 0.1:  # skip very low attention
-                    continue
-
-                infected = attempt_infection(
-                    sender_bank=self.policy.meme_banks[j],
-                    receiver_bank=self.policy.meme_banks[i],
-                    sender_meme_params=self.policy.meme_params[j],
-                    receiver_meme_params=self.policy.meme_params[i],
-                    attn_weight=a_ij,
-                    mutation_sigma=self.mutation_sigma,
-                    immunity_boost=self.immunity_boost,
-                    virality_threshold=self.virality_threshold,
-                )
-                if infected:
-                    infections += 1
-
-        # Decay immunity for all agents
-        for bank in self.policy.meme_banks:
-            bank.decay_immunity(self.immunity_decay)
-
+        self.policy.meme_bank.decay_immunity(self.immunity_decay)
         return infections
 
     def collect_rollout(self, n_steps: int) -> Tuple[float, float, int]:
@@ -705,11 +682,10 @@ class MemeplexTrainer:
             ep_reward += reward
             self._step_counter += 1
 
-            # Update meme fitness based on reward
-            for i in range(self.n_agents):
-                self.policy.meme_banks[i].update_fitness(
-                    sel_weights[i], reward, self.fitness_ema_alpha
-                )
+            # Vectorized fitness update for all agents
+            self.policy.meme_bank.update_fitness(
+                sel_weights, reward, self.fitness_ema_alpha
+            )
 
             # Infection step
             if self._step_counter % self.infection_interval == 0:
@@ -804,26 +780,15 @@ class MemeplexTrainer:
         }
 
     def get_meme_stats(self) -> Dict[str, float]:
-        """Compute diagnostic meme statistics."""
-        all_usage = []
-        all_fitness = []
-        all_meme_vecs = []
+        """Compute diagnostic meme statistics (vectorized)."""
+        usage = self.policy.meme_bank.usage_ema.cpu().numpy()       # (N, M)
+        fitness = self.policy.meme_bank.fitness_ema.cpu().numpy()   # (N, M)
+        meme_vecs = self.policy.meme_params.data.cpu().numpy()     # (N, M, D)
 
-        for i in range(self.n_agents):
-            all_usage.append(self.policy.meme_banks[i].usage_ema.cpu().numpy())
-            all_fitness.append(self.policy.meme_banks[i].fitness_ema.cpu().numpy())
-            all_meme_vecs.append(self.policy.meme_params[i].data.cpu().numpy())
-
-        usage = np.stack(all_usage)        # (N, M)
-        fitness = np.stack(all_fitness)    # (N, M)
-        meme_vecs = np.stack(all_meme_vecs)  # (N, M, D)
-
-        # Meme diversity: average pairwise cosine distance across ALL memes
         flat_memes = meme_vecs.reshape(-1, meme_vecs.shape[-1])  # (N*M, D)
         norms = np.linalg.norm(flat_memes, axis=-1, keepdims=True) + 1e-8
         normed = flat_memes / norms
         cos_sim_matrix = normed @ normed.T
-        # Average off-diagonal
         n = cos_sim_matrix.shape[0]
         diversity = 1.0 - (cos_sim_matrix.sum() - n) / (n * (n - 1))
 
@@ -839,14 +804,11 @@ class MemeplexTrainer:
         save_dict = {
             "policy":    self.policy.state_dict(),
             "optimizer": self.optimizer.state_dict(),
-            "meme_banks": [
-                {
-                    "usage_ema": bank.usage_ema.cpu(),
-                    "fitness_ema": bank.fitness_ema.cpu(),
-                    "immune_memory": dict(bank.immune_memory),
-                }
-                for bank in self.policy.meme_banks
-            ],
+            "meme_bank": {
+                "usage_ema": self.policy.meme_bank.usage_ema.cpu(),
+                "fitness_ema": self.policy.meme_bank.fitness_ema.cpu(),
+                "immune_memory": [dict(m) for m in self.policy.meme_bank.immune_memory],
+            },
         }
         torch.save(save_dict, path)
         print(f"Checkpoint saved: {path}")
@@ -856,11 +818,11 @@ class MemeplexTrainer:
         self.policy.load_state_dict(ckpt["policy"])
         if "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
-        if "meme_banks" in ckpt:
-            for bank, bank_data in zip(self.policy.meme_banks, ckpt["meme_banks"]):
-                bank.usage_ema = bank_data["usage_ema"].to(self.device)
-                bank.fitness_ema = bank_data["fitness_ema"].to(self.device)
-                bank.immune_memory = bank_data["immune_memory"]
+        if "meme_bank" in ckpt:
+            bd = ckpt["meme_bank"]
+            self.policy.meme_bank.usage_ema = bd["usage_ema"].to(self.device)
+            self.policy.meme_bank.fitness_ema = bd["fitness_ema"].to(self.device)
+            self.policy.meme_bank.immune_memory = [dict(m) for m in bd["immune_memory"]]
         print(f"Checkpoint loaded: {path}")
 
 
