@@ -110,17 +110,7 @@ def plot_n_scaling():
                 try:
                     n = int(scenario.split("v")[0])
                     n_values.append(n)
-                    
-                    # Some older algorithms didn't save peak_rolling20 directly
-                    if "peak_rolling20_win_rate" in d:
-                        peak = d["peak_rolling20_win_rate"]
-                    elif "win_rate_history" in d:
-                        wr_hist = d["win_rate_history"]
-                        peak = max(np.mean(wr_hist[max(0, i-19):i+1]) for i in range(len(wr_hist))) if wr_hist else 0.0
-                    else:
-                        peak = d.get("final_win_rate", 0)
-                        
-                    peak_wrs.append(peak * 100)
+                    peak_wrs.append(d.get("peak_rolling20_win_rate", 0) * 100)
                 except ValueError:
                     continue
                     
